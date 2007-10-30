@@ -1,0 +1,5 @@
+
+1. stop replication on the local box.
+
+ssh root@target mysqlhotcopy
+scp root@target:/snapshot snapshot
