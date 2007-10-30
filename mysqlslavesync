@@ -1,0 +1,424 @@
+#!/bin/sh
+
+#
+# * use the same relay file names as the slave we replicated FROM
+#  * Do this when I bring up the new cluster for the feed queue.
+# 
+# * parse data from the command line so that I have all options
+#
+# * mysqlhotcopy doesn't display any type of progress.... I need to fix this.
+#   This might be a hard one but I *think* I can pass --verbose as a command
+#   line argument.
+
+############
+#
+# This is a script designed to perform unattended MySQL slave sync.  You provide
+# a production MySQL slave to sync from and it will sync the current machine to
+# this image.
+#
+# THE TARGET DATABASE WILL BE DESTROYED ON THE CURRENT MYSQL MACHINE and
+# replaced with the source database.  Basically you need to know what you're
+# doing here or you could destroy a production target slave.
+#
+# Usage:
+#
+# ssh-agent bash
+# ssh-add
+# mysqlslavesync SOURCE
+#
+# SSH is used to transparently authenticate to the source DB slave to fetch
+# data.
+#
+# It then performs:
+# 
+# * use mysqlhotcopy to get a snapshot
+# * record the SHOW SLAVE STATUS output
+
+# * SCP the files to the target slave
+# * update replication positions on this box
+# * assert that the box is functioning correctly 
+
+################################################################################
+
+target_slave_stop() {
+
+    echo "SLAVE STOP;RESET SLAVE;" | mysql || exit $?
+
+}
+
+source_slave_stop() {
+
+    status=$(echo SHOW SLAVE STATUS | mysql --user=$mysql_repl_user --pass=$mysql_repl_password --host=$source )
+
+    if [ "$status" != "" ]; then
+
+        echo "SLAVE STOP;" | \
+            mysql --user=$mysql_repl_user \
+            --pass=$mysql_repl_password \
+            --host=$source 
+        
+        if [ $? != 0 ]; then
+            exit $?
+        fi
+
+    else 
+        echo "WARNING: source is master.  Not stopping slave."
+    fi
+
+}
+
+source_slave_start() {
+
+    status=$(echo SHOW SLAVE STATUS | mysql --user=$mysql_repl_user --pass=$mysql_repl_password --host=$source )
+
+    if [ "$status" != "" ]; then
+
+        echo "SLAVE START;" | \
+            mysql --user=$mysql_repl_user \
+            --pass=$mysql_repl_password \
+            --host=$source 
+
+        if [ $? != 0 ]; then
+            exit $?
+        fi
+
+    else 
+        echo "WARNING: source is master.  Not starting slave."
+    fi 
+
+}
+
+################################################################################
+
+perform_mysqlhotcopy() {
+
+    mkdir -p /d2/mysqlslavesync-snapshot
+
+    #FIXME: the rm -r could return an error here and we need to watch for it....
+    ssh root@$source "rm -r $TEMPDIR 2> /dev/null ; mkdir -p $TEMPDIR" || exit $?
+
+    ssh root@$source \
+        "/usr/local/blogindex/bin/mysqlhotcopy --dump_log_pos $mysql_db $TEMPDIR" \
+        > /d2/mysqlslavesync-snapshot/mysqlhotcopy.log
+
+    if [ $? != 0 ]; then
+        exit $?
+    fi
+
+}
+
+################################################################################
+
+perform_mysqldump() {
+
+    mkdir -p $TEMPDIR/
+
+    # older versions of mysqldump had bugs with not preserving the ENGINE or
+    # auto_increment settings (sad).
+    mysqldump="/opt/mysql/bin/mysqldump"
+
+    if [ ! -e  $mysqldump ]; then
+        mysqldump=mysqldump
+    fi
+
+    $mysqldump --version
+
+    # FIXME: this will NOT perform compression between the source and the target
+    # over the wire and is probably a BAD idea.  We should do this over SSH...
+    
+    if [ "$MYSQLDUMP_USE_SSH" = "true" ]; then
+
+        ssh -C root@$source $mysqldump --user=$mysql_repl_user \
+                                       --pass=$mysql_repl_password \
+                                       --host=$source \
+                                       --databases \
+                                       $mysql_db > $TEMPDIR/mysqldump.sql
+
+    else
+
+        $mysqldump --user=$mysql_repl_user \
+                   --pass=$mysql_repl_password \
+                   --host=$source \
+                   --databases \
+                   $mysql_db \
+                   > $TEMPDIR/mysqldump.sql
+
+    fi
+
+    if [ $? != 0 ]; then
+        exit $?
+    fi
+
+}
+
+################################################################################
+fetch_slave_settings() {
+
+    status=$(echo SHOW SLAVE STATUS | mysql --user=$mysql_repl_user --pass=$mysql_repl_password --host=$source )
+
+    if [ "$status" != "" ]; then
+
+        echo "SHOW SLAVE STATUS\G" | \
+            mysql \
+            --user=$mysql_repl_user \
+            --pass=$mysql_repl_password \
+            --host=$source \
+            > $TEMPDIR/slave_settings.dmp
+        
+        if [ $? != 0 ]; then
+            exit $?
+        fi
+
+    else 
+
+        echo "SHOW MASTER STATUS\G" | \
+            mysql --user=$mysql_repl_user \
+            --pass=$mysql_repl_password \
+            --host=$source \
+            > $TEMPDIR/master_settings.dmp
+        
+        if [ $? != 0 ]; then
+            exit $?
+        fi
+
+    fi
+
+}
+
+################################################################################
+
+transfer_data() {
+
+    scp -rp root@$source:$TEMPDIR/* $TEMPDIR
+
+}
+
+################################################################################
+#
+# We need to change the following master information on the target slave.
+#
+# CHANGE MASTER TO MASTER_HOST='db1.server.com',
+#                  MASTER_USER = 'repl',
+#                  MASTER_PASSWORD = '*****',
+#                  MASTER_LOG_FILE = 'server-bin.000656',        /* RELAY_MASTER_LOG_FILE */
+#                  MASTER_LOG_POS = 81031233                     /* EXEC_MASTER_LOG_POS */
+# ;
+
+target_change_master() {
+
+    master_user=$mysql_repl_user
+    master_password=$mysql_repl_password
+
+    if [ -e $TEMPDIR/master_settings.dmp ]; then
+
+        master_host=$source
+        relay_master_log_file=$(get_master_option File)
+        exec_master_log_pos=$(get_master_option Position)
+
+    else
+        
+        master_host=$(get_slave_option Master_Host)
+        relay_master_log_file=$(get_slave_option Relay_Master_Log_File)
+        exec_master_log_pos=$(get_slave_option Exec_Master_Log_Pos)
+    fi
+
+    tmp=$(mktemp)
+    
+    cat > $tmp <<EOF
+
+CHANGE MASTER TO MASTER_HOST='$master_host',
+                 MASTER_USER = '$master_user',
+                 MASTER_PASSWORD = '$master_password',
+                 MASTER_LOG_FILE = '$relay_master_log_file',
+                 MASTER_LOG_POS = $exec_master_log_pos
+                 ;
+
+EOF
+
+    mysql < $tmp
+
+    ## cleanup
+
+    if [ -e $TEMPDIR/master_settings.dmp ]; then
+        rm $TEMPDIR/master_settings.dmp
+    fi
+
+    if [ -e $TEMPDIR/slave_settings.dmp ]; then
+        rm $TEMPDIR/slave_settings.dmp
+    fi
+
+    rm $tmp
+
+}
+
+get_master_option() {
+
+    name=$1
+
+    slave_setting_file=$TEMPDIR/master_settings.dmp
+
+    value=$(grep $name $slave_setting_file | grep -oE '[^ ]+$')
+    
+    echo $value
+
+}
+
+get_slave_option() {
+
+    name=$1
+
+    slave_setting_file=$TEMPDIR/slave_settings.dmp
+
+    if [ "$sync_method" = "hotcopy" ]; then
+        slave_setting_file=$TEMPDIR/mysqlhotcopy.log
+    fi
+
+    value=$(grep $name $slave_setting_file | grep -oE '[^ ]+$')
+    
+    echo $value
+
+}
+
+################################################################################
+#
+target_setup_permissions() {
+    chown -R mysql.mysql $data_dir/$mysql_db
+    chmod -R 777 $data_dir/$mysql_db 
+}
+
+################################################################################
+#
+target_restart_mysql() {
+    /etc/init.d/mysql restart
+}
+
+target_slave_start() {
+    echo "SLAVE START; " | mysql
+}
+
+################################################################################
+#
+target_install_dump() {
+
+    mysql < $TEMPDIR/mysqldump.sql
+
+}
+
+################################################################################
+#
+target_install_new_db() {
+
+    #make this idepotent for debug purposes
+    if [ -d $TEMPDIR/$mysql_db ]; then
+
+        if [ -d $data_dir/$mysql_db ]; then
+            rm -rv $data_dir/$mysql_db
+        fi
+        
+        cp -rv $TEMPDIR/$mysql_db $data_dir
+
+    fi
+
+    rm -r $TEMPDIR
+
+}
+
+source="$1"
+mysql_repl_user="$2"
+mysql_repl_password="$3"
+mysql_db="$4"
+
+data_dir=/var/lib/mysql
+
+path_to_mysqlhotcopy=/usr/local/blogindex/bin
+
+##
+# hotcopy or dump .. dump is a LOT more portable but just slower.
+sync_method=dump
+
+if [ "$source" = "" ]; then
+
+    echo "SYNTAX: $0 source repl_user repl_pass databases"
+    echo ""
+    echo "Where: "
+    echo "  source:     the name of the server to clone."
+    echo "  repl_user:  the user name for the replication thread."
+    echo "  repl_pass:  the password for the replication thread."
+    echo "  database:   the DBs to clone (space separated list of strings)"
+
+    exit 1
+fi
+
+TEMPDIR=/d2/mysqlslavesync-snapshot
+
+#### 
+#
+# make sure the slave isn't running on the target box.
+
+echo "Stopping slave service on target DB..."
+target_slave_stop
+echo "Stopping slave service on target DB...done"
+
+if [ "$sync_method" = "hotcopy" ]; then
+
+    echo "Performing mysqlhotcopy on DB: $mysql_db ..."
+    perform_mysqlhotcopy
+    echo "Performing mysqlhotcopy on DB: $mysql_db ...done"
+    
+    echo "Transfering data ..." 
+    transfer_data
+    echo "Transfering data ...done" 
+
+fi
+
+if [ "$sync_method" = "dump" ]; then
+
+    echo "Stopping slave on source ..."
+    source_slave_stop
+    echo "Stopping slave on source ...done"
+
+    echo "Performing mysqldump on DB: $mysql_db ..."
+    perform_mysqldump
+    echo "Performing mysqldump on DB: $mysql_db ...done"
+
+    echo "Fetching slave settings ..."
+    fetch_slave_settings
+    echo "Fetching slave settings ...done"
+
+    echo "Starting slave on source ..."
+    source_slave_start
+    echo "Starting slave on source ...done"
+
+fi
+
+echo "Changing master replication options on target slave ..." 
+target_change_master
+echo "Changing master replication options on target slave ...done" 
+
+if [ "$sync_method" = "hotcopy" ]; then
+
+    echo "Installing new DB data..."
+    target_install_new_db
+    echo "Installing new DB data...done"
+
+    echo "Setting up permissions..." 
+    target_setup_permissions
+    echo "Setting up permissions...done" 
+
+    target_restart_mysql
+
+fi
+
+if [ "$sync_method" = "dump" ]; then
+
+    echo "Installing new DB data from dump..."
+    target_install_dump
+    echo "Installing new DB data from dump...done"
+
+    echo "Starting slave..."
+    target_slave_start
+    echo "Starting slave...done"
+
+    # FIXME: source slave start
+
+fi
