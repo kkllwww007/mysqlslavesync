@@ -1,0 +1,1 @@
+Just point this code at a MySQL box and it will clone it and setup replication.
